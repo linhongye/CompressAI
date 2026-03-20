@@ -1,0 +1,28 @@
+---
+description: Project structure and file placement rules for CompressAI fork
+alwaysApply: true
+---
+
+# Project Structure
+
+- Put reusable library code under `compressai/`.
+- Put new model implementations under `compressai/models/`.
+- Put new losses under `compressai/losses/`.
+- Put new datasets or dataset adapters under `compressai/datasets/`.
+- Put project-level CLI wrappers and orchestration scripts under `scripts/`.
+- Put script-only shared helpers under `scripts/helpers/`.
+- Put generated checkpoints, bitstreams, reconstructions, logs, and benchmark outputs under `artifacts/`.
+- Put tests under `tests/`.
+- Put long-form planning or design docs at the repo root, such as `masterPlan.md`.
+
+# File Placement Decisions
+
+- Do not place one-off experiment scripts inside `compressai/`.
+- Do not place source code inside `artifacts/`.
+- When adding a new entrypoint, prefer adding it to `scripts/` and keep the business logic in reusable modules.
+- When implementing `neutronStar2026`, keep the model code in `compressai/models/` and use `scripts/` only for train/compress/decompress/benchmark entrypoints.
+- Files in `scripts/` should stay thin wrappers or orchestration entrypoints.
+- Files in `scripts/helpers/` may contain helper utilities used only by `scripts/`.
+- Files in `compressai/` should be reusable library code, not ad-hoc experiment runners.
+- Files in `artifacts/` should be generated outputs only: checkpoints, bitstreams, reconstructions, logs, and benchmark results.
+- New planning or process documents should stay at the repo root unless they are package documentation.
