@@ -1,9 +1,11 @@
 """NeutronStar2026 model — project-local image compression model.
 
-Phase 2: Structurally identical to ``Elic2022Official`` (ELIC 2022 official).
-Decoupled from upstream ``sensetime.py`` so that future grayscale adaptation
-(Phase 3) and residual-aware training (Phase 6) can be made independently
-without risk of cross-contaminating upstream model behaviour.
+Phase 3: Native single-channel grayscale support added via the ``in_ch``
+parameter (default 1).  Structurally identical to ``Elic2022Official`` (ELIC
+2022 official) apart from the parametrized pixel-space channel count.
+Decoupled from upstream ``sensetime.py`` so that residual-aware training
+(Phase 6) can be made independently without risk of cross-contaminating
+upstream model behaviour.
 """
 
 import torch.nn as nn
@@ -71,10 +73,11 @@ class ResidualBottleneckBlock(nn.Module):
 class NeutronStar2026(SimpleVAECompressionModel):
     """NeutronStar2026: project-local image compression model.
 
-    Phase 2 baseline — structurally identical to the ELIC 2022 official
-    architecture [He2022].  Copied here so that all subsequent project
-    changes (grayscale, residual training, etc.) are isolated from the
-    upstream ``compressai`` codebase.
+    Phase 3 baseline — structurally identical to the ELIC 2022 official
+    architecture [He2022] with native single-channel grayscale support via
+    ``in_ch`` (default 1).  Copied here so that all subsequent project
+    changes (residual training, etc.) are isolated from the upstream
+    ``compressai`` codebase.
 
     Context model: unevenly grouped space-channel contextual adaptive
     coding (SCCTX) with a checkerboard spatial context per group.
@@ -90,9 +93,10 @@ class NeutronStar2026(SimpleVAECompressionModel):
         N (int): Number of main network channels.
         M (int): Number of latent space channels.
         groups (list[int]): Channel counts per channel group (must sum to M).
+        in_ch (int): Number of pixel-space channels (1 for grayscale, 3 for RGB).
     """
 
-    def __init__(self, N: int = 192, M: int = 320, groups=None, **kwargs):
+    def __init__(self, N: int = 192, M: int = 320, groups=None, in_ch: int = 1, **kwargs):
         super().__init__(**kwargs)
 
         if groups is None:
@@ -100,9 +104,10 @@ class NeutronStar2026(SimpleVAECompressionModel):
 
         self.groups = list(groups)
         assert sum(self.groups) == M
+        self.in_ch = in_ch
 
         self.g_a = nn.Sequential(
-            conv(3, N, kernel_size=5, stride=2),
+            conv(in_ch, N, kernel_size=5, stride=2),
             ResidualBottleneckBlock(N, N),
             ResidualBottleneckBlock(N, N),
             ResidualBottleneckBlock(N, N),
@@ -134,7 +139,7 @@ class NeutronStar2026(SimpleVAECompressionModel):
             ResidualBottleneckBlock(N, N),
             ResidualBottleneckBlock(N, N),
             ResidualBottleneckBlock(N, N),
-            deconv(N, 3, kernel_size=5, stride=2),
+            deconv(N, in_ch, kernel_size=5, stride=2),
         )
 
         h_a = nn.Sequential(
@@ -224,8 +229,14 @@ class NeutronStar2026(SimpleVAECompressionModel):
 
     @classmethod
     def from_state_dict(cls, state_dict):
-        """Instantiate from a state dict (compatible with elic2022-official weights)."""
+        """Instantiate from a state dict.
+
+        Automatically infers ``N`` and ``in_ch`` from the weight shapes so
+        that both grayscale (in_ch=1) and RGB (in_ch=3) checkpoints load
+        correctly without any manual argument passing.
+        """
         N = state_dict["g_a.0.weight"].size(0)
-        net = cls(N)
+        in_ch = state_dict["g_a.0.weight"].size(1)
+        net = cls(N, in_ch=in_ch)
         net.load_state_dict(state_dict)
         return net

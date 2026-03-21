@@ -51,7 +51,7 @@ IMG_EXTENSIONS = {
 class FlatImageDataset(Dataset):
     """Load all images from a flat directory (no subfolder split required)."""
 
-    def __init__(self, root: str | Path, transform=None):
+    def __init__(self, root: str | Path, transform=None, grayscale: bool = True):
         root = Path(root)
         if not root.is_dir():
             raise RuntimeError(f'Image directory not found: "{root}"')
@@ -62,9 +62,11 @@ class FlatImageDataset(Dataset):
         if not self.samples:
             raise RuntimeError(f'No images found in "{root}"')
         self.transform = transform
+        self.grayscale = grayscale
 
     def __getitem__(self, index: int):
-        img = Image.open(self.samples[index]).convert("RGB")
+        mode = "L" if self.grayscale else "RGB"
+        img = Image.open(self.samples[index]).convert(mode)
         if self.transform:
             return self.transform(img)
         return img
@@ -192,6 +194,13 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--checkpoint", type=Path, default=None,
                         help="Resume from this checkpoint.")
+    parser.add_argument(
+        "--grayscale",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Train on single-channel grayscale images (default: True). "
+             "Use --no-grayscale for RGB.",
+    )
 
     return parser.parse_args(argv)
 
@@ -228,9 +237,14 @@ def main(argv=None):
         transforms.ToTensor(),
     ])
 
-    train_dataset = FlatImageDataset(args.train_dir, transform=train_tf)
-    test_dataset = FlatImageDataset(args.test_dir, transform=test_tf)
-    print(f"Train images: {len(train_dataset)}  |  Test images: {len(test_dataset)}", flush=True)
+    train_dataset = FlatImageDataset(args.train_dir, transform=train_tf, grayscale=args.grayscale)
+    test_dataset = FlatImageDataset(args.test_dir, transform=test_tf, grayscale=args.grayscale)
+    mode_label = "grayscale" if args.grayscale else "RGB"
+    print(
+        f"Train images: {len(train_dataset)}  |  Test images: {len(test_dataset)}  "
+        f"[mode: {mode_label}]",
+        flush=True,
+    )
 
     train_loader = DataLoader(
         train_dataset,
@@ -248,8 +262,9 @@ def main(argv=None):
     )
 
     # Model
-    net = NeutronStar2026(N=args.N, M=args.M).to(device)
-    print(f"Model: NeutronStar2026(N={args.N}, M={args.M})", flush=True)
+    in_ch = 1 if args.grayscale else 3
+    net = NeutronStar2026(N=args.N, M=args.M, in_ch=in_ch).to(device)
+    print(f"Model: NeutronStar2026(N={args.N}, M={args.M}, in_ch={in_ch})", flush=True)
 
     # Optimizers
     conf = {

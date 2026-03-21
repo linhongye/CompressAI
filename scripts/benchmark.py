@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import pickle
 import sys
 import time
@@ -24,7 +25,9 @@ for path in (REPO_ROOT, SCRIPT_DIR):
 import compressai
 import torch
 import torch.nn.functional as F
+from PIL import Image
 from torchvision import transforms
+from torchvision.transforms.functional import to_tensor
 
 from compressai.ops import compute_padding
 from compressai.utils.eval_model import __main__ as eval_model_main
@@ -116,6 +119,13 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
             "<output-root>/<run-name> is used."
         ),
     )
+    parser.add_argument(
+        "--grayscale",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Load images as single-channel grayscale and report psnr_gray (default: True). "
+             "Use --no-grayscale for RGB mode.",
+    )
     return parser.parse_args(wrapper_argv), passthrough_argv
 
 
@@ -173,8 +183,11 @@ def load_model_for_run(args: argparse.Namespace, run: int | str):
 
 
 @torch.no_grad()
-def compress_and_reconstruct(model, image_path: Path, device: str, use_half: bool) -> dict:
-    x = eval_model_main.read_image(image_path)
+def compress_and_reconstruct(
+    model, image_path: Path, device: str, use_half: bool, grayscale: bool = True
+) -> dict:
+    pil_mode = "L" if grayscale else "RGB"
+    x = to_tensor(Image.open(image_path).convert(pil_mode))
     x_batched = x.unsqueeze(0)
 
     h, w = x_batched.size(2), x_batched.size(3)
@@ -193,21 +206,29 @@ def compress_and_reconstruct(model, image_path: Path, device: str, use_half: boo
     dec_time = time.time() - dec_start
 
     x_hat = F.pad(out_dec["x_hat"], unpad).float().cpu()
-    metrics = eval_model_main.compute_metrics(x_batched, x_hat, 255)
     num_pixels = x_batched.size(0) * x_batched.size(2) * x_batched.size(3)
     bpp = sum(len(s[0]) for s in out_enc["strings"]) * 8.0 / num_pixels
+
+    mse = F.mse_loss(x_hat, x_batched).item()
+    psnr_gray = 10.0 * math.log10(1.0 / mse) if mse > 0 else float("inf")
+
+    result_metrics: dict = {
+        "psnr_gray": psnr_gray,
+        "bpp": bpp,
+        "encoding_time": enc_time,
+        "decoding_time": dec_time,
+    }
+
+    if not grayscale:
+        rgb_metrics = eval_model_main.compute_metrics(x_batched, x_hat, 255)
+        result_metrics["psnr-rgb"] = rgb_metrics["psnr-rgb"]
+        result_metrics["ms-ssim-rgb"] = rgb_metrics["ms-ssim-rgb"]
 
     return {
         "strings": out_enc["strings"],
         "shape": out_enc["shape"],
         "x_hat": x_hat,
-        "metrics": {
-            "psnr-rgb": metrics["psnr-rgb"],
-            "ms-ssim-rgb": metrics["ms-ssim-rgb"],
-            "bpp": bpp,
-            "encoding_time": enc_time,
-            "decoding_time": dec_time,
-        },
+        "metrics": result_metrics,
     }
 
 
@@ -230,6 +251,7 @@ def benchmark_run(
     compressed_root: Path,
     decompressed_root: Path,
     report_root: Path,
+    grayscale: bool = True,
 ) -> dict:
     if args.entropy_estimation:
         raise ValueError(
@@ -266,20 +288,22 @@ def benchmark_run(
         log_progress(f"[run {run_index}/{len(runs)}] Model {run_label} is ready.")
 
         per_image = []
-        totals = {
-            "psnr-rgb": 0.0,
-            "ms-ssim-rgb": 0.0,
+        totals: dict[str, float] = {
+            "psnr_gray": 0.0,
             "bpp": 0.0,
             "encoding_time": 0.0,
             "decoding_time": 0.0,
         }
+        if not grayscale:
+            totals["psnr-rgb"] = 0.0
+            totals["ms-ssim-rgb"] = 0.0
 
         for image_index, image_path in enumerate(image_paths, start=1):
             log_progress(
                 f"[run {run_index}/{len(runs)}][image {image_index}/{len(image_paths)}] "
                 f"Compressing {image_path.name}."
             )
-            compressed = compress_and_reconstruct(model, image_path, device, args.half)
+            compressed = compress_and_reconstruct(model, image_path, device, args.half, grayscale)
 
             compressed_path = run_compressed_root / f"{image_path.stem}.bin"
             reconstruction_path = run_decompressed_root / f"{image_path.stem}.png"
@@ -297,17 +321,20 @@ def benchmark_run(
             for key in totals:
                 totals[key] += image_metrics[key]
 
+            psnr_label = (
+                f"PSNR(gray) {image_metrics['psnr_gray']:.4f}"
+                if grayscale
+                else f"PSNR(rgb) {image_metrics['psnr-rgb']:.4f}"
+            )
             metrics_message = (
                 f"[run {run_index}/{len(runs)}][image {image_index}/{len(image_paths)}] "
                 f"Finished {image_path.name}: {image_metrics['bpp']:.4f} bpp, "
-                f"{image_metrics['psnr-rgb']:.4f} PSNR, "
+                f"{psnr_label}, "
                 f"enc {image_metrics['encoding_time']:.3f}s, "
                 f"dec {image_metrics['decoding_time']:.3f}s."
             )
-            if args.verbose:
-                metrics_message += (
-                    f" MS-SSIM {image_metrics['ms-ssim-rgb']:.6f}."
-                )
+            if args.verbose and not grayscale:
+                metrics_message += f" MS-SSIM {image_metrics['ms-ssim-rgb']:.6f}."
             log_progress(metrics_message)
 
         averages = {key: totals[key] / len(per_image) for key in totals}
@@ -328,9 +355,14 @@ def benchmark_run(
         log_progress(f"[run {run_index}/{len(runs)}] Writing report to {report_path}.")
         report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
         all_reports.append(report)
+        avg_psnr_msg = (
+            f"avg psnr_gray {averages['psnr_gray']:.4f}"
+            if grayscale
+            else f"avg psnr-rgb {averages['psnr-rgb']:.4f}"
+        )
         log_progress(
             f"[run {run_index}/{len(runs)}] Completed {run_label}: "
-            f"avg {averages['bpp']:.4f} bpp, avg {averages['psnr-rgb']:.4f} PSNR."
+            f"avg {averages['bpp']:.4f} bpp, {avg_psnr_msg}."
         )
 
     return {
@@ -386,6 +418,7 @@ def main() -> None:
         compressed_root=compressed_root,
         decompressed_root=decompressed_root,
         report_root=json_report_root,
+        grayscale=wrapper_args.grayscale,
     )
     log_progress("Benchmark finished. Printing JSON summary.")
     print(json.dumps(summary, indent=2))

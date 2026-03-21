@@ -57,7 +57,7 @@ class ImageFolder(Dataset):
         split (string): split mode ('train' or 'val')
     """
 
-    def __init__(self, root, transform=None, split="train"):
+    def __init__(self, root, transform=None, split="train", grayscale: bool = False):
         splitdir = Path(root) / split
 
         if not splitdir.is_dir():
@@ -66,6 +66,7 @@ class ImageFolder(Dataset):
         self.samples = sorted(f for f in splitdir.iterdir() if f.is_file())
 
         self.transform = transform
+        self.grayscale = grayscale
 
     def __getitem__(self, index):
         """
@@ -75,7 +76,8 @@ class ImageFolder(Dataset):
         Returns:
             img: `PIL.Image.Image` or transformed `PIL.Image.Image`.
         """
-        img = Image.open(self.samples[index]).convert("RGB")
+        mode = "L" if self.grayscale else "RGB"
+        img = Image.open(self.samples[index]).convert(mode)
         if self.transform:
             return self.transform(img)
         return img
