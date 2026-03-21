@@ -291,7 +291,8 @@ def main(argv=None):
                 "optimizer": optimizer.state_dict(),
                 "aux_optimizer": aux_optimizer.state_dict(),
                 "lr_scheduler": lr_scheduler.state_dict(),
-                "args": vars(args),
+                "args": {k: str(v) if isinstance(v, Path) else v
+                         for k, v in vars(args).items()},
             },
             is_best,
             args.output_dir,

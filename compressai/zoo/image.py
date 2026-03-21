@@ -36,6 +36,7 @@ from compressai.models import (
     FactorizedPriorReLU,
     JointAutoregressiveHierarchicalPriors,
     MeanScaleHyperprior,
+    NeutronStar2026,
     ScaleHyperprior,
 )
 
@@ -52,6 +53,7 @@ __all__ = [
 ]
 
 model_architectures = {
+    "neutron-star-2026": NeutronStar2026,
     "bmshj2018-factorized": FactorizedPrior,
     "bmshj2018_factorized_relu": FactorizedPriorReLU,
     "bmshj2018-hyperprior": ScaleHyperprior,

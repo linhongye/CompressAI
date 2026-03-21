@@ -27,6 +27,8 @@
 # OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
 # ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+from compressai.models import NeutronStar2026
+
 from .image import (
     bmshj2018_factorized,
     bmshj2018_factorized_relu,
@@ -41,6 +43,7 @@ from .pretrained import load_pretrained as load_state_dict
 from .video import ssf2020
 
 image_models = {
+    "neutron-star-2026": NeutronStar2026,
     "bmshj2018-factorized": bmshj2018_factorized,
     "bmshj2018-factorized-relu": bmshj2018_factorized_relu,
     "bmshj2018-hyperprior": bmshj2018_hyperprior,
