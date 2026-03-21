@@ -30,6 +30,7 @@ from torchvision import transforms
 from torchvision.transforms.functional import to_tensor
 
 from compressai.ops import compute_padding
+from compressai.supernova import Supernova
 from compressai.utils.eval_model import __main__ as eval_model_main
 
 from helpers import BENCHMARKS_DIR, ensure_dir, normalize_passthrough_args
@@ -228,6 +229,7 @@ def compress_and_reconstruct(
         "strings": out_enc["strings"],
         "shape": out_enc["shape"],
         "x_hat": x_hat,
+        "num_pixels": num_pixels,
         "metrics": result_metrics,
     }
 
@@ -250,6 +252,7 @@ def benchmark_run(
     image_paths: list[Path],
     compressed_root: Path,
     decompressed_root: Path,
+    residual_root: Path,
     report_root: Path,
     grayscale: bool = True,
 ) -> dict:
@@ -277,10 +280,6 @@ def benchmark_run(
     all_reports = []
     for run_index, run in enumerate(runs, start=1):
         run_label = make_run_label(args, run)
-        log_progress(f"[run {run_index}/{len(runs)}] Preparing output directories for {run_label}.")
-        run_compressed_root = ensure_dir(compressed_root / run_label)
-        run_decompressed_root = ensure_dir(decompressed_root / run_label)
-
         log_progress(f"[run {run_index}/{len(runs)}] Loading model {run_label}.")
         model = load_model_for_run(args, run).eval().to(device)
         if args.half:
@@ -297,6 +296,10 @@ def benchmark_run(
         if not grayscale:
             totals["psnr-rgb"] = 0.0
             totals["ms-ssim-rgb"] = 0.0
+        if grayscale:
+            totals["residual_time"] = 0.0
+            totals["bpp_residual"] = 0.0
+            totals["bpp_total"] = 0.0
 
         for image_index, image_path in enumerate(image_paths, start=1):
             log_progress(
@@ -305,8 +308,8 @@ def benchmark_run(
             )
             compressed = compress_and_reconstruct(model, image_path, device, args.half, grayscale)
 
-            compressed_path = run_compressed_root / f"{image_path.stem}.bin"
-            reconstruction_path = run_decompressed_root / f"{image_path.stem}.png"
+            compressed_path = compressed_root / f"{image_path.stem}.bin"
+            reconstruction_path = decompressed_root / f"{image_path.stem}.png"
 
             write_compressed_output(compressed_path, compressed)
             write_reconstruction(reconstruction_path, compressed["x_hat"])
@@ -317,6 +320,26 @@ def benchmark_run(
                 "reconstruction_file": str(reconstruction_path),
                 **compressed["metrics"],
             }
+
+            if grayscale:
+                residual_path = residual_root / f"{image_path.stem}.res"
+                res_start = time.time()
+                Supernova.makeResidual(image_path, compressed["x_hat"], residual_path)
+                res_time = time.time() - res_start
+
+                res_bytes = residual_path.stat().st_size
+                n_px = compressed["num_pixels"]
+                bpp_res = res_bytes * 8.0 / n_px
+                bpp_total = image_metrics["bpp"] + bpp_res
+
+                image_metrics.update({
+                    "residual_file": str(residual_path),
+                    "residual_size_bytes": res_bytes,
+                    "bpp_residual": bpp_res,
+                    "bpp_total": bpp_total,
+                    "residual_time": res_time,
+                })
+
             per_image.append(image_metrics)
             for key in totals:
                 totals[key] += image_metrics[key]
@@ -331,8 +354,15 @@ def benchmark_run(
                 f"Finished {image_path.name}: {image_metrics['bpp']:.4f} bpp, "
                 f"{psnr_label}, "
                 f"enc {image_metrics['encoding_time']:.3f}s, "
-                f"dec {image_metrics['decoding_time']:.3f}s."
+                f"dec {image_metrics['decoding_time']:.3f}s"
             )
+            if grayscale:
+                metrics_message += (
+                    f", res {image_metrics['residual_size_bytes'] / 1024:.1f}KB"
+                    f" ({image_metrics['bpp_residual']:.4f} bpp_res,"
+                    f" total {image_metrics['bpp_total']:.4f} bpp),"
+                    f" res_time {image_metrics['residual_time']:.3f}s"
+                )
             if args.verbose and not grayscale:
                 metrics_message += f" MS-SSIM {image_metrics['ms-ssim-rgb']:.6f}."
             log_progress(metrics_message)
@@ -345,8 +375,9 @@ def benchmark_run(
             "metric": args.metric,
             "dataset": str(args.dataset),
             "num_images": len(per_image),
-            "compressed_dir": str(run_compressed_root),
-            "reconstruction_dir": str(run_decompressed_root),
+            "compressed_dir": str(compressed_root),
+            "reconstruction_dir": str(decompressed_root),
+            "residual_dir": str(residual_root) if grayscale else None,
             "results": averages,
             "per_image": per_image,
         }
@@ -355,15 +386,21 @@ def benchmark_run(
         log_progress(f"[run {run_index}/{len(runs)}] Writing report to {report_path}.")
         report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
         all_reports.append(report)
+
         avg_psnr_msg = (
             f"avg psnr_gray {averages['psnr_gray']:.4f}"
             if grayscale
             else f"avg psnr-rgb {averages['psnr-rgb']:.4f}"
         )
-        log_progress(
-            f"[run {run_index}/{len(runs)}] Completed {run_label}: "
-            f"avg {averages['bpp']:.4f} bpp, {avg_psnr_msg}."
+        avg_summary = (
+            f"avg {averages['bpp']:.4f} bpp, {avg_psnr_msg}"
         )
+        if grayscale:
+            avg_summary += (
+                f", avg bpp_res {averages['bpp_residual']:.4f}"
+                f", avg bpp_total {averages['bpp_total']:.4f}"
+            )
+        log_progress(f"[run {run_index}/{len(runs)}] Completed {run_label}: {avg_summary}.")
 
     return {
         "name": f"{args.architecture}-{args.metric}",
@@ -393,10 +430,12 @@ def main() -> None:
     report_root = resolve_report_root(wrapper_args)
     compressed_root = ensure_dir(report_root / "compressed_image")
     decompressed_root = ensure_dir(report_root / "decompressed_image")
+    residual_root = ensure_dir(report_root / "residual")
     json_report_root = ensure_dir(report_root / "report")
     log_progress(f"Benchmark output root: {report_root}")
     log_progress(f"Compressed files will be written to: {compressed_root}")
     log_progress(f"Decoded images will be written to: {decompressed_root}")
+    log_progress(f"Residual files will be written to: {residual_root}")
     log_progress(f"JSON reports will be written to: {json_report_root}")
 
     if not args.dataset.is_dir():
@@ -417,6 +456,7 @@ def main() -> None:
         image_paths,
         compressed_root=compressed_root,
         decompressed_root=decompressed_root,
+        residual_root=residual_root,
         report_root=json_report_root,
         grayscale=wrapper_args.grayscale,
     )

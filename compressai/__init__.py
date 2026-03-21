@@ -41,6 +41,7 @@ from compressai import (
     typing,
     zoo,
 )
+from compressai.supernova import Supernova
 
 try:
     from .version import __version__
@@ -103,6 +104,7 @@ __all__ = [
     "transforms",
     "typing",
     "zoo",
+    "Supernova",
     "available_entropy_coders",
     "get_entropy_coder",
     "set_entropy_coder",
