@@ -30,6 +30,7 @@
 from .base import *
 from .google import *
 from .pointcloud import *
+from .neutronstar import *
 from .sensetime import *
 from .vbr import *
 from .waseda import *
