@@ -4,22 +4,22 @@
 面向 `8bit` 单通道灰度 `BMP` 图像，基于 `compressai` 演进出一个可持续迭代的压缩系统：
 
 1. 第一阶段先得到可训练、可压缩、可解压、可 benchmark 的灰度有损模型。
-2. 第二阶段在有损主码流之上增加残差支路，使系统具备“从压缩文件还原出无损原图”的能力。
+2. 第二阶段在有损主码流之上增加残差支路，使系统具备"从压缩文件还原出无损原图"的能力。
 3. 第三阶段再围绕总压缩率、编码速度、解码速度、工程可维护性做优化。
 
 ## 对当前 7 步计划的调整
 当前思路的大方向是对的，但顺序需要调整，否则会把 4 类问题混在一起：
 
 1. 数据格式问题：当前训练和评测链路默认是 RGB，不先拆出来，后面 benchmark 会失真。
-2. 模型改造问题：`elic2022-official` 复制成 `neutronStar2026` 是合理的，但要先做“等价克隆”，再做灰度改造。
+2. 模型改造问题：`elic2022-official` 复制成 `neutronStar2026` 是合理的，但要先做"等价克隆"，再做灰度改造。
 3. 系统设计问题：残差无损恢复要先做一个独立、可验证的基线，再去修改 loss；否则无法知道 loss 是否真的降低了总码率。
-4. 工程组织问题：`benchmark.py` 应该尽早建立，但一开始只做“调度和记录”，不要一上来就承载太多编解码逻辑。
+4. 工程组织问题：`benchmark.py` 应该尽早建立，但一开始只做"调度和记录"，不要一上来就承载太多编解码逻辑。
 
 结论：
 
 - `scripts/` 文件夹应该尽早建立。
-- `neutronStar2026` 应该先做“行为等价复制”，再做灰度化。
-- “残差算法”必须拆成两个阶段：
+- `neutronStar2026` 应该先做"行为等价复制"，再做灰度化。
+- "残差算法"必须拆成两个阶段：
   - 先做无损恢复链路基线。
   - 再做 residual-aware loss 优化总码率。
 - 性能优化必须放在功能和 benchmark 稳定之后。
@@ -27,7 +27,7 @@
 ## 规划原则
 每个阶段都必须满足以下约束：
 
-1. 阶段目标单一，不同时解决“模型结构 + 数据格式 + 残差设计 + 性能优化”四件事。
+1. 阶段目标单一，不同时解决"模型结构 + 数据格式 + 残差设计 + 性能优化"四件事。
 2. 阶段完成后必须能跑 benchmark，并生成可归档结果。
 3. 每个阶段的改动范围尽量控制在少量文件内，适合一次 agent 实施，目标是单阶段实现和验证成本控制在 `500k token` 以内。
 4. 优先复用现有 `compressai` 能力，避免过早重写训练、评测、熵编码基础设施。
@@ -128,7 +128,7 @@ artifacts/
 - 接入模型注册和脚本可调用入口。
 
 ### 为什么这是独立阶段
-如果直接在原始 `elic2022-official` 上改，后续很难区分“是灰度化引入的问题”还是“是你自定义结构引入的问题”。
+如果直接在原始 `elic2022-official` 上改，后续很难区分"是灰度化引入的问题"还是"是你自定义结构引入的问题"。
 
 ### 交付物
 - `neutronStar2026` 模型类。
@@ -198,7 +198,7 @@ artifacts/
 - 固定一套小规模训练配置和测试配置。
 
 ### 为什么在这里训练
-只有在“模型身份稳定 + 灰度链路稳定”后，训练结果才有比较意义。
+只有在"模型身份稳定 + 灰度链路稳定"后，训练结果才有比较意义。
 
 ### 交付物
 - 可复现的训练命令。
@@ -223,7 +223,7 @@ artifacts/
 
 ## Phase 5: 残差无损恢复基线
 ### 目标
-先验证“有损主码流 + 残差支路 = 可无损恢复”这件事在系统层面是否成立。
+先验证"有损主码流 + 残差支路 = 可无损恢复"这件事在系统层面是否成立。
 
 ### 范围
 - 定义残差：从原图与有损重建图之间计算残差。
@@ -231,7 +231,7 @@ artifacts/
 - 先用简单、可靠、可验证的残差编码方式，不急着做学习式残差模型。
 
 ### 为什么不能直接先改 loss
-如果没有一个独立的残差基线，你无法知道未来 loss 改动到底是在降低“总码率”，还是只是在牺牲主码流质量。
+如果没有一个独立的残差基线，你无法知道未来 loss 改动到底是在降低"总码率"，还是只是在牺牲主码流质量。
 
 ### 交付物
 - 残差生成逻辑。
@@ -258,48 +258,217 @@ artifacts/
 - 适合作为单次 agent 任务
 
 ## Phase 6: residual-aware loss 设计与训练
+
+### 背景与动机
+
+Phase 5 的 benchmark 数据揭示了关键事实：
+
+| 指标 | Phase 5 实测值 | 占 bpp_total |
+|---|---|---|
+| `bpp_main` | 0.190 | 4.4% |
+| `bpp_residual` | 4.085 | 95.6% |
+| `bpp_total` | 4.275 | 100% |
+
+残差码率占总码率的 **96%**。当前 Phase 4 的标准 MSE loss 优化的是"让 `x_hat` 尽量好看"，
+但我们的真正目标是 **最小化 bpp_total = bpp_main + bpp_residual**（最终输出是无损恢复的原图，
+不关心 `x_hat` 的视觉质量）。
+
+### 核心理论依据
+
+残差 `r = x_orig − round(x_hat × 255)` 通常服从 **Laplace 分布**（以 0 为中心，尖峰重尾）。
+对于 Laplace(0, b)：
+
+- 尺度参数 b = E[|r|]，即 L1 范数
+- 熵 H = log₂(2eb) bits/pixel
+
+因此：
+
+- **MSE (L2) 是 Gaussian 残差模型下的最优估计** → 不匹配实际分布
+- **L1 是 Laplacian 残差模型下的最优估计** → 更匹配实际分布
+
+用 Phase 5 数据验证：PSNR~32 dB → RMS error ~ 6.4 像素值 → 对 Laplace 分布 b ≈ 4.5，
+理论熵 H = log₂(2e × 4.5) ≈ 4.6 bpp，而实测 `bpp_residual = 4.085`（zstd 利用了空间相关性，
+略低于 i.i.d. 理论值）。
+
+### MSE vs L1 对残差压缩的影响
+
+- **MSE** 倾向于把误差"均匀摊开"（所有像素都有小误差）→ 残差中几乎没有零值 → 熵高 → 不利于压缩
+- **L1** 倾向于让更多像素误差恰好为 0，代价是少数像素误差稍大 → 残差更稀疏 → 熵低 → 更利于压缩
+
+所以 **将 MSE 替换为 L1 是信息论上合理的第一步改进**。
+
+### 子阶段拆分策略
+
+Phase 6 拆成 4 个子阶段，每个子阶段独立可验证，复杂度控制在单次 agent 任务内。
+后一个子阶段以前一个子阶段的结果为基础，如果某个子阶段效果不佳可以停下来分析，
+不需要一次性押注在复杂设计上。
+
+---
+
+## Phase 6a: 实现 `ResidualAwareRDLoss`（L1 替换 MSE）
+
 ### 目标
-修改 `neutronStar2026` 的训练目标，让模型不只优化重建误差，还显式考虑残差支路的成本，最终优化 `bpp_total`。
+新建 `ResidualAwareRDLoss` 类，将 distortion 从 MSE 替换为 L1，作为 bpp_residual 的可微代理。
+不改模型结构，不改训练流程，只新增 criterion 类。
+
+### 设计
+
+当前 loss：
+
+```
+L_current = λ × 255² × MSE(x_hat, x) + bpp_main
+```
+
+新 loss：
+
+```
+L_new = λ × 255 × L1(x_hat, x) + bpp_main
+```
+
+注意尺度变化：MSE 前系数是 255²，L1 前系数是 255。lambda 的数值意义不同，需要重新校准。
 
 ### 范围
-- 设计新的 loss。
-- loss 至少同时考虑：
-  - 主码流码率
-  - 有损重建误差
-  - 残差体积或残差码率代理项
-- 保持训练和 benchmark 链路可追踪。
-
-### 这一阶段的核心思想
-不是单纯让 `x_hat` 看起来更好，而是让“主码流 + 残差”的总比特数更低。
+- 在 `compressai/losses/rate_distortion.py` 中新增 `ResidualAwareRDLoss` 类。
+- 注册到 criterion registry。
+- 在 `compressai/losses/__init__.py` 中导出。
+- `forward` 返回值中保留 `mse_loss` 字段用于监控对比。
 
 ### 交付物
-- 新 criterion。
-- 新训练配置。
-- 与 Phase 5 可直接比较的 checkpoint。
+- `ResidualAwareRDLoss` 类（在 `compressai/losses/rate_distortion.py`）。
+- `compressai/losses/__init__.py` 更新导出。
 
 ### 可验证结果
-- 仍然保持无损恢复成功。
-- 在相同测试集上，`bpp_total` 优于 Phase 5 基线，或者在相近 `bpp_total` 下得到更稳的主码流质量。
-
-### 建议 benchmark
-- Phase 5 vs Phase 6 对比重点：
-  - `bpp_total`
-  - `bpp_main`
-  - `bpp_residual`
-  - `lossless_restored`
-- 此阶段 benchmark 的主判据不再是单独的 `psnr_gray`，而是总码率是否下降。
-
-### 风险提示
-- 如果一开始就把 loss 设计得过于复杂，会显著增加调试成本。
-- 建议先上一个简单可解释版本，再逐步增加项。
+- 新 loss 类可以被 `import` 和实例化。
+- `forward(output, target)` 返回字典包含 `{"loss", "bpp_loss", "mse_loss", "l1_loss", "residual_l1"}`。
+- 对同一组 `(output, target)` 数据，`bpp_loss` 与原 `RateDistortionLoss` 一致（验证 bpp 计算未被改动）。
 
 ### 复杂度控制
-- 预计改动文件数：`4-8`
+- 预计改动文件数：`2`（`rate_distortion.py` + `__init__.py`）
 - 适合作为单次 agent 任务
+
+---
+
+## Phase 6b: 接入训练脚本并完成首次 L1 训练
+
+### 目标
+将 `train_neutronstar.py` 改为支持选择 criterion（默认仍为 MSE，可切换到 L1），
+用新 loss 训练一个 checkpoint，验证训练链路完整可用。
+
+### 范围
+- `train_neutronstar.py` 新增 `--criterion` 参数，可选 `mse`（默认）或 `residual-l1`。
+- 日志输出适配新 loss 的字段（打印 `l1_loss` 和 `residual_l1`）。
+- 用新 criterion 跑一轮完整训练（epoch 数与 Phase 4 相同），得到 checkpoint。
+
+### 交付物
+- 更新后的 `train_neutronstar.py`。
+- 一个用 `residual-l1` criterion 训练的 checkpoint。
+- 训练日志（保存到 `artifacts/logs/`）。
+
+### 可验证结果
+- `python scripts/train_neutronstar.py --criterion residual-l1 ...` 正常启动并完成训练。
+- 训练过程中 loss 持续下降。
+- 用 `--criterion mse`（默认）训练行为与 Phase 4 完全一致（不破坏回归）。
+
+### lambda 调参建议
+- 起始 lambda 值：`0.01`（与 Phase 4 相同数值）。
+- 如果 bpp_main > 1.0，减小 lambda。
+- 如果 bpp_residual 无明显下降，增大 lambda。
+- 目标是找到 bpp_total 的最低点。
+
+### 复杂度控制
+- 预计改动文件数：`1`（`train_neutronstar.py`）
+- 适合作为单次 agent 任务
+
+---
+
+## Phase 6c: benchmark 对比 L1 vs MSE
+
+### 目标
+用 Phase 6b 产出的 checkpoint 跑 benchmark，与 Phase 5 基线做定量对比，
+验证 L1 loss 是否降低了 `bpp_total`。
+
+### 范围
+- 对 Phase 6b 的 checkpoint 执行完整 benchmark（含残差计算）。
+- 与 Phase 5 的 benchmark 结果横向对比。
+- 输出对比报告。
+
+### 交付物
+- Phase 6c 的 benchmark 结果（JSON，落盘到报告目录）。
+- 对比摘要，至少包含：
+
+| 指标 | Phase 5 (MSE) | Phase 6c (L1) | 变化方向 |
+|---|---|---|---|
+| `bpp_main` | — | — | — |
+| `bpp_residual` | — | — | — |
+| `bpp_total` | — | — | ↓ 目标 |
+| `lossless_restored` | true | true | 不变 |
+
+### 可验证结果
+- `lossless_restored == true`（无损恢复仍然成功）。
+- `bpp_total` 是否下降是 Phase 6c 的主判据。
+- 如果 `bpp_total` 没有下降或反而上升，记录为已知问题，进入 Phase 6d 分析原因。
+
+### 决策点
+- **如果 `bpp_total` 下降**：L1 loss 有效。可选择继续 Phase 6d 做进一步改进，或直接进入 Phase 7。
+- **如果 `bpp_total` 持平或上升**：分析 `bpp_main` 和 `bpp_residual` 的变化方向，调整 lambda 或进入 Phase 6d 尝试 dead-zone 改进。
+
+### 复杂度控制
+- 预计改动文件数：`0`（只执行 benchmark 命令，不改代码）
+- 适合作为单次 agent 任务
+
+---
+
+## Phase 6d: Dead-zone L1 与量化感知改进（条件性）
+
+### 前置条件
+Phase 6c 已完成。无论 6c 结果如何，都可以进入 6d 尝试进一步改进。
+
+### 目标
+在 L1 基础上加入 **dead-zone**（量化感知）：当连续误差 `|x_hat − x| < 0.5/255` 时，
+量化后残差恰好为 0，不需要任何比特。因此这个范围内的误差不应被惩罚。
+
+### 设计
+
+```
+L_deadzone = λ × 255 × E[max(|x_hat − x| − 0.5/255, 0)] + bpp_main
+```
+
+Dead-zone 释放的模型容量可以让更多像素的残差精确为 0，进一步降低残差熵。
+
+### 范围
+- 在 `compressai/losses/rate_distortion.py` 中新增 `DeadZoneResidualLoss` 类。
+- `compressai/losses/__init__.py` 中导出。
+- `train_neutronstar.py` 的 `--criterion` 新增 `residual-dz` 选项。
+
+### 交付物
+- `DeadZoneResidualLoss` 类。
+- 用 `residual-dz` 训练的 checkpoint。
+- 与 Phase 6c 结果的 benchmark 对比。
+
+### 可验证结果
+- `lossless_restored == true`。
+- 对比 Phase 6c（L1）和 Phase 5（MSE）：`bpp_total` 是否进一步下降。
+
+### 可选的进一步探索
+如果 dead-zone 效果显著，可以考虑进一步加入 STE（Straight-Through Estimator）模拟 uint8 量化：
+
+```python
+x_hat_255 = x_hat * 255
+x_hat_q = x_hat_255 + (x_hat_255.round() - x_hat_255).detach()  # STE
+residual = target_255 - x_hat_q.clamp(0, 255)
+```
+
+这属于可选探索，不是 Phase 6d 的硬性交付。
+
+### 复杂度控制
+- 预计改动文件数：`2-3`
+- 适合作为单次 agent 任务
+
+---
 
 ## Phase 7: 残差链路工程化集成
 ### 目标
-把“主码流 + 残差 + 元数据”集成为一个规范化压缩流程，而不是多个临时文件拼接。
+把"主码流 + 残差 + 元数据"集成为一个规范化压缩流程，而不是多个临时文件拼接。
 
 ### 范围
 - 统一压缩文件组织方式。
@@ -372,6 +541,10 @@ artifacts/
 4. 灰度有损训练基线
 5. 残差无损恢复基线
 6. residual-aware loss 优化总码率
+   - 6a. 实现 `ResidualAwareRDLoss`（L1 替换 MSE）— 只改 loss 类，2 文件
+   - 6b. 接入训练脚本，完成首次 L1 训练 — 只改训练脚本，1 文件
+   - 6c. benchmark 对比 L1 vs MSE — 不改代码，只跑 benchmark
+   - 6d. Dead-zone L1 量化感知改进（条件性）— 2-3 文件
 7. 端到端压缩流程工程化
 8. 性能优化
 
@@ -397,7 +570,7 @@ artifacts/
 
 1. 在还未建立 benchmark 基线前，直接修改 loss。
 2. 在还未完成灰度原生支持前，用 RGB 结果长期替代灰度结果。
-3. 在残差总码率口径未建立前，过早讨论“最终压缩率是否更优”。
+3. 在残差总码率口径未建立前，过早讨论"最终压缩率是否更优"。
 4. 在功能尚未稳定前，提前做大规模性能优化。
 5. 让 `benchmark.py` 同时承载训练、压缩、解压、评测全部底层逻辑，导致后续难以维护。
 
@@ -408,4 +581,4 @@ artifacts/
 2. Phase 2：`neutronStar2026` 等价复制
 3. Phase 3：单通道灰度原生支持
 
-这 3 个阶段完成后，项目就会进入“可稳定迭代”的状态，后续训练、残差和 loss 设计都会更顺。
+这 3 个阶段完成后，项目就会进入"可稳定迭代"的状态，后续训练、残差和 loss 设计都会更顺。
