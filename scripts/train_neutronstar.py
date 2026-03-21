@@ -153,12 +153,12 @@ def test_epoch(epoch, loader, model, criterion):
     return meters["loss"].avg
 
 
-def save_checkpoint(state: dict, is_best: bool, output_dir: Path):
-    ckpt_path = output_dir / "checkpoint.pth.tar"
-    torch.save(state, ckpt_path)
+def save_checkpoint(state: dict, is_best: bool, output_dir: Path, run_name: str = "checkpoint"):
+    last_path = output_dir / f"{run_name}_last.pth.tar"
+    torch.save(state, last_path)
     if is_best:
-        best_path = output_dir / "checkpoint_best_loss.pth.tar"
-        shutil.copyfile(ckpt_path, best_path)
+        best_path = output_dir / f"{run_name}_best.pth.tar"
+        shutil.copyfile(last_path, best_path)
         print(f"  [*] New best checkpoint saved → {best_path}", flush=True)
 
 
@@ -194,6 +194,9 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--checkpoint", type=Path, default=None,
                         help="Resume from this checkpoint.")
+    parser.add_argument("--run-name", type=str, default="checkpoint",
+                        help="Base name for saved checkpoint files. "
+                             "Saves <run-name>_last.pth.tar and <run-name>_best.pth.tar.")
     parser.add_argument(
         "--grayscale",
         action=argparse.BooleanOptionalAction,
@@ -311,6 +314,7 @@ def main(argv=None):
             },
             is_best,
             args.output_dir,
+            run_name=args.run_name,
         )
 
     print(f"\nTraining complete. Best loss: {best_loss:.4f}", flush=True)
