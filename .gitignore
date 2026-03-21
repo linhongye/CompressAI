@@ -10,6 +10,7 @@ compressai/version.py
 tags
 venv*/
 venv/
+image/
 
 # Created by gitignore.io
 ### Python ###
