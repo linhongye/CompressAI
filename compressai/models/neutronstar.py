@@ -1,11 +1,13 @@
 """NeutronStar2026 model — project-local image compression model.
 
-Phase 3: Native single-channel grayscale support added via the ``in_ch``
-parameter (default 1).  Structurally identical to ``Elic2022Official`` (ELIC
-2022 official) apart from the parametrized pixel-space channel count.
-Decoupled from upstream ``sensetime.py`` so that residual-aware training
-(Phase 6) can be made independently without risk of cross-contaminating
-upstream model behaviour.
+Phase 7a: Replaced conv-based ``AttentionBlock`` (gated mechanism) with
+``WindowAttentionBlock`` (window-based multi-head self-attention with
+shifted windows and relative position bias) for true global/semi-global
+feature modelling.
+
+Previous phases:
+- Phase 3: Native single-channel grayscale support via ``in_ch`` (default 1).
+- Phase 6: Residual-aware loss training (TotalBppLoss).
 """
 
 import torch.nn as nn
@@ -21,8 +23,8 @@ from compressai.latent_codecs import (
     HyperpriorLatentCodec,
 )
 from compressai.layers import (
-    AttentionBlock,
     CheckerboardMaskedConv2d,
+    WindowAttentionBlock,
     conv1x1,
     conv3x3,
     sequential_channel_ramp,
@@ -115,23 +117,23 @@ class NeutronStar2026(SimpleVAECompressionModel):
             ResidualBottleneckBlock(N, N),
             ResidualBottleneckBlock(N, N),
             ResidualBottleneckBlock(N, N),
-            AttentionBlock(N),
+            WindowAttentionBlock(N, shift=False),
             conv(N, N, kernel_size=5, stride=2),
             ResidualBottleneckBlock(N, N),
             ResidualBottleneckBlock(N, N),
             ResidualBottleneckBlock(N, N),
             conv(N, M, kernel_size=5, stride=2),
-            AttentionBlock(M),
+            WindowAttentionBlock(M, shift=True),
         )
 
         self.g_s = nn.Sequential(
-            AttentionBlock(M),
+            WindowAttentionBlock(M, shift=True),
             deconv(M, N, kernel_size=5, stride=2),
             ResidualBottleneckBlock(N, N),
             ResidualBottleneckBlock(N, N),
             ResidualBottleneckBlock(N, N),
             deconv(N, N, kernel_size=5, stride=2),
-            AttentionBlock(N),
+            WindowAttentionBlock(N, shift=False),
             ResidualBottleneckBlock(N, N),
             ResidualBottleneckBlock(N, N),
             ResidualBottleneckBlock(N, N),

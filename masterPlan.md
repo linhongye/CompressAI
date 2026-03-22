@@ -513,138 +513,382 @@ class TotalBppLoss(nn.Module):
 
 ---
 
-## Phase 6d: Dead-zone L1 与量化感知改进（条件性）
+## Phase 6 阶段总结
 
-### 前置条件
-Phase 6c 已完成。无论 6c 结果如何，都可以进入 6d 尝试进一步改进。
+### 各 loss 实测对比
+
+| 指标 | Phase 5 (MSE) | Phase 6b (L1, λ=1.0) | Phase 6c (TotalBppLoss) |
+|---|---|---|---|
+| `psnr_gray` | ~32 dB | **40.04 dB** | 36.37 dB |
+| `bpp_main` | 0.190 | 0.218 | 0.283 |
+| `bpp_residual` | 4.085 | **3.314** | 3.562 |
+| `bpp_total` | 4.275 | **3.532** | 3.844 |
+| 残差占比 | 95.6% | 93.8% | 92.7% |
+
+### 关键结论
+
+1. **L1 loss**：相比 Phase 5 的 MSE，bpp_total 下降 17.4%。
+   TotalBppLoss（Phase 6c）反而全面回退，Laplacian i.i.d. 熵公式不够准确（实际残差有空间
+   相关性，zstd 利用了这些相关性，i.i.d. 模型高估了真实熵）。但是依然继续选择使用TotalBppLoss, 
+   这样可以保证未来模型改造以后依然可以用这套loss来做评估.
+
+2. **残差压缩已接近理论极限**：Phase 6b 的 PSNR 40.04 dB → MAE ≈ 1.8，
+   Laplacian i.i.d. 理论熵 ≈ 3.27 bpp，实测 bpp_residual = 3.314，
+   zstd 已经把残差压到距离理论下界仅 0.04 bpp。
+
+3. **继续改 loss 收益极其有限**：在当前重建质量（MAE）水平下，残差压缩已无空间。
+   **降低 bpp_total 的唯一出路是降低 MAE 本身**——让网络产生更精确的重建。
+
+4. **不同图像表现差异巨大**：bpp_total 从 2.90（PSNR 42+ dB）到 4.32（PSNR 31 dB），
+   说明当前网络对某些纹理模式适配不足，网络容量未被有效利用。
+
+---
+
+## Phase 7: 网络架构改造
+
+### 背景与动机
+
+Phase 6 的结论表明，loss 优化空间已经耗尽。当前瓶颈是**网络重建精度不够**：
+
+- `bpp_residual` 占 `bpp_total` 的 94%，且残差压缩已接近理论极限
+- 降低 `bpp_total` 的唯一途径是降低 MAE（让重建更准确）→ 需要更强的网络
+
+当前 `NeutronStar2026` 直接复制自 ELIC 2022（`Elic2022Official`），存在三个结构性问题：
+
+**问题 1："注意力"不是真正的自注意力。**
+`AttentionBlock` 是 Cheng2020 的门控机制（`a ⊙ σ(b) + identity`），内部只有 3×3 卷积，
+感受野局限于局部。对 1024×1024 灰度扫描图的长程空间相关性完全无法建模。
+
+**问题 2：编解码器之间没有跳跃连接。**
+解码器是纯顺序 `nn.Sequential`，所有空间细节必须从 64×64 的潜在空间恢复。
+高频纹理在 16× 下采样中严重丢失，这直接导致残差大。
+
+**问题 3：潜在空间 channel groups 为 RGB 设计。**
+`groups = [16, 16, 32, 64, 192]` 来自 ELIC 原始 RGB 设计。灰度信息量约为 RGB 的 1/3，
+但分组策略完全不变。最后一组 192 通道中大量通道接近零信息。
+
+### 子阶段拆分策略
+
+Phase 7 拆成 3 个子阶段，每个子阶段改造一个独立方面，可以独立训练和评测。
+如果某个子阶段效果不佳可以回退，不影响其他改进。
+
+---
+
+## Phase 7a: 引入 Window-based Self-Attention
 
 ### 目标
-在 L1 基础上加入 **dead-zone**（量化感知）：当连续误差 `|x_hat − x| < 0.5/255` 时，
-量化后残差恰好为 0，不需要任何比特。因此这个范围内的误差不应被惩罚。
+将 `AttentionBlock`（门控机制，3×3 局部感受野）替换为 **Window-based Multi-Head
+Self-Attention (W-MSA)**，赋予模型真正的全局/半全局建模能力。
+
+### 为什么这是最高优先级
+
+当前 `AttentionBlock` 的本质是：
+
+```python
+def forward(self, x):
+    a = self.conv_a(x)     # 3 个 ResidualUnit，每个只有 3×3 conv
+    b = self.conv_b(x)     # 3 个 ResidualUnit + 1×1 conv
+    return a * sigmoid(b) + x   # 逐元素门控
+```
+
+这只是一个局部非线性变换，**不是注意力机制**。近年来 SOTA 图像压缩模型
+（STF, LIC-TCM, ELIC-SM）都已用 Window/Swin attention 替代。对于灰度扫描图像的
+大尺度重复纹理和长程相关性，真正的自注意力收益尤其大。
 
 ### 设计
 
-```
-L_deadzone = λ × 255 × E[max(|x_hat − x| − 0.5/255, 0)] + bpp_main
-```
-
-Dead-zone 释放的模型容量可以让更多像素的残差精确为 0，进一步降低残差熵。
-
-### 范围
-- 在 `compressai/losses/rate_distortion.py` 中新增 `DeadZoneResidualLoss` 类。
-- `compressai/losses/__init__.py` 中导出。
-- `train_neutronstar.py` 的 `--criterion` 新增 `residual-dz` 选项。
-
-### 交付物
-- `DeadZoneResidualLoss` 类。
-- 用 `residual-dz` 训练的 checkpoint。
-- 与 Phase 6c 结果的 benchmark 对比。
-
-### 可验证结果
-- `lossless_restored == true`。
-- 对比 Phase 6c（L1）和 Phase 5（MSE）：`bpp_total` 是否进一步下降。
-
-### 可选的进一步探索
-如果 dead-zone 效果显著，可以考虑进一步加入 STE（Straight-Through Estimator）模拟 uint8 量化：
+新增 `WindowAttentionBlock` 替换编解码器中的 `AttentionBlock`：
 
 ```python
-x_hat_255 = x_hat * 255
-x_hat_q = x_hat_255 + (x_hat_255.round() - x_hat_255).detach()  # STE
-residual = target_255 - x_hat_q.clamp(0, 255)
+class WindowAttentionBlock(nn.Module):
+    """Window-based multi-head self-attention with optional shifted windows.
+
+    Applies W-MSA within non-overlapping windows of size window_size × window_size,
+    alternating with SW-MSA (shifted by window_size // 2) for cross-window
+    information flow. Uses relative position bias.
+    """
+
+    def __init__(self, dim, num_heads=8, window_size=8, shift=False):
+        ...
+
+    def forward(self, x):
+        # x: (B, C, H, W) — 与 AttentionBlock 接口一致
+        # 1. 将特征图分割为不重叠的 window_size × window_size 窗口
+        # 2. 在每个窗口内做标准多头自注意力
+        # 3. 合并窗口，恢复原始空间分辨率
+        # 4. 残差连接
+        ...
 ```
 
-这属于可选探索，不是 Phase 6d 的硬性交付。
+替换位置（编码器和解码器各 2 处）：
+
+```
+Encoder g_a:
+  ... 3× ResBlock ...
+  AttentionBlock(N)       →  WindowAttentionBlock(N, shift=False)
+  ... 3× ResBlock ...
+  AttentionBlock(M)       →  WindowAttentionBlock(M, shift=True)
+
+Decoder g_s:
+  AttentionBlock(M)       →  WindowAttentionBlock(M, shift=True)
+  ... 3× ResBlock ...
+  AttentionBlock(N)       →  WindowAttentionBlock(N, shift=False)
+  ... 3× ResBlock ...
+```
+
+### 范围
+- 在 `compressai/layers/` 中新增 `WindowAttentionBlock` 类。
+- 修改 `compressai/models/neutronstar.py` 中 `NeutronStar2026` 的 `g_a` 和 `g_s`，
+  用 `WindowAttentionBlock` 替换 `AttentionBlock`。
+- `compressai/layers/__init__.py` 导出新类。
+- 不改变模型注册名、接口签名和 latent codec。
+
+### 交付物
+- `WindowAttentionBlock` 类。
+- 更新后的 `NeutronStar2026`（使用新注意力）。
+- 用 L1 loss（Phase 6b 最优 criterion）从头训练的 checkpoint。
+
+### 可验证结果
+- `forward`、`compress`、`decompress` 链路无报错。
+- `lossless_restored == true`（无损恢复仍然成功）。
+- 与 Phase 6b 对比：
+
+| 指标 | Phase 6b (旧 Attention) | Phase 7a (W-MSA) | 期望方向 |
+|---|---|---|---|
+| `bpp_main` | 0.218 | — | 可能略↑ |
+| `bpp_residual` | 3.314 | — | **↓ 主判据** |
+| `bpp_total` | 3.532 | — | **↓** |
+| `psnr_gray` | 40.04 | — | ↑ |
+
+### 注意事项
+- `window_size` 必须能整除特征图尺寸。对于 1024×1024 输入，经 2 次 stride-2 后
+  为 256×256（第一个 AttentionBlock 位置），`window_size=8` 可以整除。
+  经 4 次 stride-2 后为 64×64（第二个 AttentionBlock 位置），同样可以整除。
+- 如果输入图不是 `window_size` 的整倍数，需要加 padding 逻辑。
+- 参数量会增加（attention 的 QKV 投影），但主要增长在 self-attention 层，
+  相对于 9 个 ResBlock 的总参数量占比不大。
+- 建议先用小 epoch 验证训练稳定性，再做完整训练。
 
 ### 复杂度控制
-- 预计改动文件数：`2-3`
+- 预计改动文件数：`3`（新增 attention 层 + 修改模型 + 更新 `__init__.py`）
 - 适合作为单次 agent 任务
 
 ---
 
-## Phase 7: 残差链路工程化集成
+## Phase 7b: 编解码器跳跃连接
+
 ### 目标
-把"主码流 + 残差 + 元数据"集成为一个规范化压缩流程，而不是多个临时文件拼接。
+在编码器和解码器之间增加**跳跃连接（skip connections）**，让解码器能直接获取
+编码器中间层的空间细节，减少 16× 下采样导致的高频信息丢失。
+
+### 为什么需要跳跃连接
+
+当前解码器必须从 64×64 × M 的瓶颈完全重建 1024×1024 × 1 的图像。
+4 层 deconv 上采样过程中，高频纹理细节（边缘、纹理梯度方向等）无法从如此
+紧凑的潜在表示中恢复，这正是残差大的直接原因。
+
+跳跃连接让解码器在每次上采样后叠加编码器同分辨率的特征，类似 U-Net，
+显著改善高频重建。
+
+### 设计
+
+**关键约束**：跳跃连接不能直接传递编码器原始特征（那会绕过信息瓶颈，
+使得潜在空间不承载信息，码率失控）。必须在跳跃路径上做信息压缩。
+
+方案：跳跃特征经过一个**轻量级瓶颈**（1×1 conv 降维 + ReLU + 1×1 conv 升维），
+控制信息泄漏量：
+
+```python
+class NeutronStar2026(SimpleVAECompressionModel):
+    def __init__(self, N=192, M=320, ...):
+        # 编码器保持 nn.Sequential，但拆成可索引的阶段
+        self.enc_stage1 = nn.Sequential(...)   # in_ch → N, ↓2
+        self.enc_stage2 = nn.Sequential(...)   # N → N, ↓2
+        self.enc_stage3 = nn.Sequential(...)   # N → N, ↓2
+        self.enc_stage4 = nn.Sequential(...)   # N → M, ↓2
+
+        # 跳跃路径的轻量级瓶颈（控制信息泄漏）
+        skip_mid = N // 4
+        self.skip_adapt1 = nn.Sequential(conv1x1(N, skip_mid), nn.ReLU(), conv1x1(skip_mid, N))
+        self.skip_adapt2 = nn.Sequential(conv1x1(N, skip_mid), nn.ReLU(), conv1x1(skip_mid, N))
+        self.skip_adapt3 = nn.Sequential(conv1x1(N, skip_mid), nn.ReLU(), conv1x1(skip_mid, N))
+
+        # 解码器拆成阶段，每个阶段后 += skip
+        self.dec_stage1 = nn.Sequential(...)   # M → N, ↑2
+        self.dec_stage2 = nn.Sequential(...)   # N → N, ↑2
+        self.dec_stage3 = nn.Sequential(...)   # N → N, ↑2
+        self.dec_stage4 = nn.Sequential(...)   # N → in_ch, ↑2
+
+    def forward(self, x):
+        # Encoder（保存中间特征）
+        e1 = self.enc_stage1(x)      # 512×512
+        e2 = self.enc_stage2(e1)     # 256×256
+        e3 = self.enc_stage3(e2)     # 128×128
+        y  = self.enc_stage4(e3)     # 64×64
+
+        # Latent codec
+        y_out = self.latent_codec(y)
+        y_hat = y_out["y_hat"]
+
+        # Decoder（叠加跳跃特征）
+        d1 = self.dec_stage1(y_hat)               # 128×128
+        d1 = d1 + self.skip_adapt3(e3)
+        d2 = self.dec_stage2(d1)                   # 256×256
+        d2 = d2 + self.skip_adapt2(e2)
+        d3 = self.dec_stage3(d2)                   # 512×512
+        d3 = d3 + self.skip_adapt1(e1)
+        x_hat = self.dec_stage4(d3)                # 1024×1024
+
+        return {"x_hat": x_hat, "likelihoods": y_out["likelihoods"]}
+```
+
+### 对 compress / decompress 的影响
+
+**这是最关键的设计问题**：`compress` 时编码器可以产生跳跃特征，但 `decompress`
+时只有潜在码流，没有编码器特征。
+
+解决方案：**跳跃连接只在训练时使用，推理时关闭**。训练时跳跃连接辅助解码器学习
+更好的权重，推理时解码器独立工作。具体做法：
+
+```python
+def forward(self, x):
+    # 训练时使用跳跃连接
+    ...
+
+def decompress(self, *args, **kwargs):
+    # 推理时不使用跳跃连接（编码器特征不可用）
+    y_out = self.latent_codec.decompress(...)
+    x_hat = self.g_s(y_out["y_hat"]).clamp_(0, 1)   # 纯解码器路径
+    return {"x_hat": x_hat}
+```
+
+这意味着跳跃连接起到**训练正则化**的作用：它强制解码器的中间特征与编码器对齐，
+间接提升解码器独立工作时的重建质量。
+
+替代方案（更复杂但更强）：将跳跃特征也编码到码流中（多尺度超先验）。
+这属于 Phase 7b 的可选延伸，不是硬性交付。
 
 ### 范围
-- 统一压缩文件组织方式。
-- 统一解压逻辑。
-- 统一 benchmark 输入输出口径。
-
-### 为什么这一阶段单独做
-前面的阶段是验证算法与总码率；这一阶段才是把验证过的方案沉淀成稳定工程接口。
+- 修改 `compressai/models/neutronstar.py`：将 `g_a` 和 `g_s` 从 `nn.Sequential`
+  拆成可索引的阶段，新增 skip adaptation 层。
+- 修改 `forward` 方法以使用跳跃连接。
+- 确保 `compress` 和 `decompress` 在无跳跃连接时仍能正常工作。
 
 ### 交付物
-- 统一压缩文件格式或统一输出目录规范。
-- `compress_neutronstar.py` 与 `decompress_neutronstar.py` 工程化稳定。
-- benchmark 可以直接对端到端流程做验证。
+- 带跳跃连接的 `NeutronStar2026`。
+- 训练 checkpoint。
+- 与 Phase 7a 的 benchmark 对比。
 
 ### 可验证结果
-- 单条命令完成压缩、解压、无损校验。
-- benchmark 不再依赖人工拼接中间文件。
+- `forward` 训练正常，loss 下降。
+- `compress` / `decompress` 链路无报错。
+- `lossless_restored == true`。
+- 与 Phase 7a 对比 `bpp_total` 是否下降。
 
-### 建议 benchmark
-- 正式端到端 benchmark：
-  - 成功率
-  - `bpp_total`
-  - 编码时间
-  - 解码时间
-  - 无损恢复正确率
+### 决策点
+- **如果 training-only skip 有效**：bpp_residual 下降，说明解码器权重确实更好了。
+  可以考虑进一步将跳跃特征编码到码流中。
+- **如果效果不明显**：training-only skip 的信号太弱。需要改为将跳跃特征
+  纳入码流（多尺度超先验），但这会增加 bpp_main。
 
 ### 复杂度控制
-- 预计改动文件数：`4-7`
+- 预计改动文件数：`1`（`neutronstar.py`）
 - 适合作为单次 agent 任务
 
-## Phase 8: 性能优化
+---
+
+## Phase 7c: 潜在空间 channel groups 重新设计
+
 ### 目标
-在正确性和总码率稳定后，再做编码速度、解码速度、显存和吞吐优化。
+重新设计潜在空间的 channel groups 分组策略，使其适配灰度图像的信息分布，
+提升上下文模型效率。
+
+### 当前问题
+
+当前 `groups = [16, 16, 32, 64, 192]`（sum = M = 320）来自 ELIC 为 RGB 设计的原始配置。
+
+灰度单通道图像的信息量约为 RGB 的 1/3，但：
+- 最后一组 192 通道过大，大量通道接近零信息，上下文模型为它们浪费了计算
+- 前两组各 16 通道过小，承载信息不足，限制了后续组的上下文质量
+- bpp_main 仅 0.22（320 通道中实际只有约 0.22 × 64² = 900 bits 有效信息），
+  说明通道利用率极低
+
+### 设计
+
+**策略：减小 M，重新分配 groups，增多分组数量**
+
+候选方案（需要实验对比）：
+
+| 方案 | M | groups | 分组数 | 说明 |
+|---|---|---|---|---|
+| 当前 | 320 | [16, 16, 32, 64, 192] | 5 | ELIC 原始 RGB |
+| A | 192 | [16, 16, 32, 32, 32, 32, 32] | 7 | 更均匀、更多组 |
+| B | 256 | [16, 16, 32, 32, 64, 96] | 6 | 适度减小、更均匀 |
+| C | 192 | [24, 24, 24, 24, 48, 48] | 6 | 灰度定制 |
+
+选择原则：
+- `sum(groups) == M`
+- 分组更均匀，避免最后一组过大
+- 更多的组数 → 每组有更多上下文历史 → 上下文模型更精准
+- M 不宜太小，否则信息瓶颈太紧
 
 ### 范围
-- 优化热点路径。
-- 减少不必要的数据复制和磁盘中间产物。
-- 评估是否需要替换部分脚本组织或批处理方式。
-
-### 为什么最后做
-过早做性能优化，容易把未稳定的算法逻辑固化，增加返工成本。
+- 修改 `NeutronStar2026.__init__` 中的 `groups` 默认值和 M 默认值。
+- 上下文模型（`channel_context`、`spatial_context`、`param_aggregation`）
+  会自动适配新的 groups（它们已经用循环生成），无需额外改代码。
+- 超先验 h_a / h_s 的通道数可能需要随 M 调整。
 
 ### 交付物
-- 优化前后 benchmark 对比。
-- 明确的优化收益说明。
+- 调整 groups/M 后的 `NeutronStar2026`。
+- 至少 2 个方案的训练 checkpoint。
+- 各方案的 benchmark 对比。
 
 ### 可验证结果
-- 在不破坏正确性的前提下：
-  - 编码更快，或
-  - 解码更快，或
-  - 占用更低
+- 训练链路正常。
+- `lossless_restored == true`。
+- 对比不同 groups 方案的 `bpp_main`、`bpp_residual`、`bpp_total`。
+- 选出 `bpp_total` 最低的方案。
 
-### 建议 benchmark
-- 和 Phase 7 的最终稳定版直接对比：
-  - `bpp_total`
-  - `encode_time`
-  - `decode_time`
-  - 峰值显存或内存
+### 注意事项
+- 改变 M 后旧 checkpoint 不再兼容，必须从头训练。
+- 建议先用小 epoch（如 20）快速筛选方案，再对最优方案做完整训练。
+- 如果 Phase 7a 和 7b 的改动已经稳定，7c 应在它们之上做（累积改进）。
 
 ### 复杂度控制
-- 每次只做一类优化。
-- 如果优化目标不同，建议拆成多个小子阶段实施。
+- 预计改动文件数：`1`（`neutronstar.py`）
+- 适合作为单次 agent 任务（每个方案独立训练）
+
+---
 
 ## 建议的实施顺序总结
-最终建议按以下顺序推进：
 
-1. `scripts/` + `benchmark.py` + 最小实验框架
-2. 复制 `elic2022-official` 为 `neutronStar2026`
-3. 单通道灰度原生支持
-4. 灰度有损训练基线
-5. 残差无损恢复基线
-6. residual-aware loss 优化总码率
-   - 6a. 实现 `ResidualAwareRDLoss`（L1 替换 MSE）— 只改 loss 类，2 文件
-   - 6b. 接入训练脚本，完成首次 L1 训练 — 只改训练脚本，1 文件
-   - 6c. 实现 `TotalBppLoss`（直接最小化 total BPP，消除 lambda）— 3 文件
-   - 6d. Dead-zone L1 量化感知改进（条件性）— 2-3 文件
-7. 端到端压缩流程工程化
-8. 性能优化
+### 已完成阶段
+
+1. ~~Phase 1：脚本框架与 benchmark 基线~~
+2. ~~Phase 2：`neutronStar2026` 等价复制~~
+3. ~~Phase 3：单通道灰度原生支持~~
+4. ~~Phase 4：灰度有损训练基线~~
+5. ~~Phase 5：残差无损恢复基线~~
+6. ~~Phase 6：residual-aware loss 优化总码率~~
+   - ~~6a. 实现 `ResidualAwareRDLoss`（L1 替换 MSE）~~
+   - ~~6b. 接入训练脚本，完成首次 L1 训练~~
+   - ~~6c. 实现 `TotalBppLoss`~~
+
+### 进行中
+
+7. Phase 7：网络架构改造
+   - 7a. 引入 Window-based Self-Attention — 替换 4 处 AttentionBlock，3 文件
+   - 7b. 编解码器跳跃连接 — 拆解 Sequential，增加 skip，1 文件
+   - 7c. 潜在空间 channel groups 重新设计 — 调整 M 和 groups，1 文件
+
+### 后续可选方向（待 Phase 7 结果确定后规划）
+
+- 端到端压缩流程工程化（统一压缩文件格式）
+- 性能优化（编解码速度、显存）
+- 训练流程优化（数据增强、学习率调度、更大 patch）
+- 学习式残差编码（如果 zstd 成为新瓶颈）
 
 ## 每阶段的验收模板
-后续每个阶段都建议统一使用下面的验收模板：
 
 ### 阶段完成判定
 - 功能是否可运行
@@ -659,21 +903,3 @@ residual = target_255 - x_hat_q.clamp(0, 255)
 - checkpoint
 - benchmark 结果
 - 已知问题列表
-
-## 不建议的做法
-以下做法应尽量避免：
-
-1. 在还未建立 benchmark 基线前，直接修改 loss。
-2. 在还未完成灰度原生支持前，用 RGB 结果长期替代灰度结果。
-3. 在残差总码率口径未建立前，过早讨论"最终压缩率是否更优"。
-4. 在功能尚未稳定前，提前做大规模性能优化。
-5. 让 `benchmark.py` 同时承载训练、压缩、解压、评测全部底层逻辑，导致后续难以维护。
-
-## 第一批推荐实施任务
-如果按 agent 小步推进，推荐优先做以下 3 个阶段：
-
-1. Phase 1：脚本框架与 benchmark 基线
-2. Phase 2：`neutronStar2026` 等价复制
-3. Phase 3：单通道灰度原生支持
-
-这 3 个阶段完成后，项目就会进入"可稳定迭代"的状态，后续训练、残差和 loss 设计都会更顺。
