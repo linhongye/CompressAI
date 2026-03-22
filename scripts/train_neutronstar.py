@@ -34,7 +34,7 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
-from compressai.losses import ResidualAwareRDLoss
+from compressai.losses import TotalBppLoss
 from compressai.models import NeutronStar2026
 from compressai.optimizers import net_aux_optimizer
 
@@ -121,6 +121,7 @@ def train_one_epoch(model, criterion, loader, optimizer, aux_optimizer, epoch, c
                 f'  l1={out_criterion["l1_loss"].item():.6f}'
                 f'  mse={out_criterion["mse_loss"].item():.6f}'
                 f'  bpp={out_criterion["bpp_loss"].item():.4f}'
+                f'  bpp_res={out_criterion["bpp_residual_est"].item():.4f}'
                 f"  aux={aux_loss.item():.4f}",
                 flush=True,
             )
@@ -131,7 +132,7 @@ def test_epoch(epoch, loader, model, criterion):
     model.eval()
     device = next(model.parameters()).device
 
-    meters = {k: AverageMeter() for k in ("loss", "l1_loss", "mse_loss", "bpp_loss", "aux_loss")}
+    meters = {k: AverageMeter() for k in ("loss", "l1_loss", "mse_loss", "bpp_loss", "bpp_residual_est", "aux_loss")}
 
     for d in loader:
         d = d.to(device)
@@ -142,6 +143,7 @@ def test_epoch(epoch, loader, model, criterion):
         meters["l1_loss"].update(out_criterion["l1_loss"].item())
         meters["mse_loss"].update(out_criterion["mse_loss"].item())
         meters["bpp_loss"].update(out_criterion["bpp_loss"].item())
+        meters["bpp_residual_est"].update(out_criterion["bpp_residual_est"].item())
         meters["aux_loss"].update(model.aux_loss().item())
 
     print(
@@ -150,6 +152,7 @@ def test_epoch(epoch, loader, model, criterion):
         f'  l1={meters["l1_loss"].avg:.6f}'
         f'  mse={meters["mse_loss"].avg:.6f}'
         f'  bpp={meters["bpp_loss"].avg:.4f}'
+        f'  bpp_res={meters["bpp_residual_est"].avg:.4f}'
         f'  aux={meters["aux_loss"].avg:.4f}',
         flush=True,
     )
@@ -185,8 +188,9 @@ def parse_args(argv=None):
     parser.add_argument("-lr", "--learning-rate", type=float, default=1e-4)
     parser.add_argument("--aux-learning-rate", type=float, default=1e-3)
     parser.add_argument("--patch-size", type=int, nargs=2, default=(256, 256))
-    parser.add_argument("--lmbda", type=float, default=1.0,
-                        help="Rate-distortion trade-off lambda.")
+    parser.add_argument("--lmbda", type=float, default=None,
+                        help="Unused (kept for checkpoint compatibility). "
+                             "TotalBppLoss has no lambda.")
     parser.add_argument("-n", "--num-workers", type=int, default=2)
     parser.add_argument("--clip-max-norm", type=float, default=1.0)
     parser.add_argument("--N", type=int, default=192,
@@ -280,8 +284,8 @@ def main(argv=None):
     optimizer, aux_optimizer = optims["net"], optims["aux"]
     lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, "min")
 
-    criterion = ResidualAwareRDLoss(lmbda=args.lmbda)
-    print(f"Criterion: ResidualAwareRDLoss (lambda={args.lmbda})", flush=True)
+    criterion = TotalBppLoss()
+    print("Criterion: TotalBppLoss (neural_bpp + residual_entropy)", flush=True)
 
     last_epoch = 0
     if args.checkpoint is not None:

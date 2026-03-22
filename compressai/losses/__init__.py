@@ -29,10 +29,11 @@
 
 from . import pointcloud
 from .pointcloud import *
-from .rate_distortion import RateDistortionLoss, ResidualAwareRDLoss
+from .rate_distortion import RateDistortionLoss, ResidualAwareRDLoss, TotalBppLoss
 
 __all__ = [
     *pointcloud.__all__,
     "RateDistortionLoss",
     "ResidualAwareRDLoss",
+    "TotalBppLoss",
 ]

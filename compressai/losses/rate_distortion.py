@@ -110,3 +110,48 @@ class ResidualAwareRDLoss(nn.Module):
             return out
         else:
             return out[self.return_type]
+
+
+@register_criterion("TotalBppLoss")
+class TotalBppLoss(nn.Module):
+    """Directly minimize total BPP = neural BPP + estimated residual entropy.
+
+    Uses the Laplacian entropy formula H = log2(2*e*b) where b = MAE (in uint8
+    scale) as the residual BPP estimate.  Both terms are in bpp units so no
+    Lagrangian lambda is needed.  Includes STE (Straight-Through Estimator)
+    quantization to account for the uint8 rounding that happens at inference.
+    """
+
+    _EPSILON = 1e-6
+
+    def __init__(self, return_type="all"):
+        super().__init__()
+        self.return_type = return_type
+
+    def forward(self, output, target):
+        N, _, H, W = target.size()
+        out = {}
+        num_pixels = N * H * W
+
+        out["bpp_loss"] = sum(
+            (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
+            for likelihoods in output["likelihoods"].values()
+        )
+
+        x_hat = output["x_hat"]
+        x_hat_q = (x_hat * 255).round() / 255
+        x_hat_q = x_hat + (x_hat_q - x_hat).detach()
+
+        residual_abs = (target - x_hat_q).abs() * 255
+        mae = residual_abs.mean()
+        out["bpp_residual_est"] = torch.log2(2 * math.e * (mae + self._EPSILON))
+
+        out["loss"] = out["bpp_loss"] + out["bpp_residual_est"]
+
+        out["l1_loss"] = mae / 255
+        out["mse_loss"] = F.mse_loss(x_hat, target)
+
+        if self.return_type == "all":
+            return out
+        else:
+            return out[self.return_type]
