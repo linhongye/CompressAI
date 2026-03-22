@@ -381,39 +381,134 @@ L_new = λ × 255 × L1(x_hat, x) + bpp_main
 
 ---
 
-## Phase 6c: benchmark 对比 L1 vs MSE
+## Phase 6c: 实现 `TotalBppLoss`（直接最小化 total BPP）
 
 ### 目标
-用 Phase 6b 产出的 checkpoint 跑 benchmark，与 Phase 5 基线做定量对比，
-验证 L1 loss 是否降低了 `bpp_total`。
+设计并实现一个新的 loss 函数，**直接最小化 total BPP = neural BPP + residual BPP**，
+用残差的 Laplacian 熵估计替代 L1 代理，消除 lambda 调参的需要。
+
+### 理论依据
+
+Phase 6a/6b 的 L1 loss 是残差熵的**线性代理**：
+
+```
+L_l1 = λ × 255 × MAE + bpp_neural
+```
+
+但真正要最小化的是 total BPP。残差在 Laplacian 模型下的熵为：
+
+```
+H(residual) = log₂(2e × MAE_uint8)   bits/pixel
+```
+
+这是 MAE 的**对数**，不是线性关系。用 L1 做代理有两个问题：
+
+1. **需要手动调 lambda**：L1 和 bpp_neural 量纲不同，必须靠 lambda 平衡，最优值需实验搜索。
+2. **梯度权重不自适应**：L1 对所有 MAE 水平给予相同梯度。但实际上 MAE 越小时，
+   每降低 1 单位 MAE 节省的残差熵越多（∂H/∂b = 1/(b·ln2)），应该推得更用力。
+
+直接用 `log₂(2e × MAE)` 作为 distortion 项，就是在直接最小化残差熵本身：
+
+```
+L_total = bpp_neural + log₂(2e × MAE_uint8)
+```
+
+两项都是 bpp 单位，**不需要 lambda**，优化器自动找 neural BPP 和 residual BPP 的最优平衡点。
+
+### 与 L1 的梯度对比
+
+| 当前 MAE (uint8) | L1 loss 有效梯度 | log(MAE) loss 有效梯度 |
+|---|---|---|
+| 5.0 | λ × 255 = 常数 | 1 / (5.0 × ln2) = 0.29 |
+| 1.0 | λ × 255 = 常数 | 1 / (1.0 × ln2) = 1.44 |
+| 0.5 | λ × 255 = 常数 | 1 / (0.5 × ln2) = 2.89 |
+| 0.1 | λ × 255 = 常数 | 1 / (0.1 × ln2) = 14.4 |
+
+log(MAE) 的梯度随 MAE 减小而自动加大，在低误差区间推力更强。
+
+### 设计
+
+```python
+class TotalBppLoss(nn.Module):
+    """Directly minimize total BPP = neural BPP + estimated residual entropy.
+
+    Uses the Laplacian entropy formula H = log₂(2e·b) where b = MAE as the
+    residual BPP estimate. Both terms are in bpp units, so no lambda is needed.
+    Includes STE quantization to account for the uint8 rounding at inference.
+    """
+
+    def forward(self, output, target):
+        N, _, H, W = target.size()
+        num_pixels = N * H * W
+
+        # Neural BPP (unchanged)
+        bpp_neural = sum(
+            torch.log(lk).sum() / (-math.log(2) * num_pixels)
+            for lk in output["likelihoods"].values()
+        )
+
+        # STE quantization: forward does round(), backward passes through
+        x_hat = output["x_hat"]
+        x_hat_q = (x_hat * 255).round() / 255
+        x_hat_q = x_hat + (x_hat_q - x_hat).detach()
+
+        # Laplacian entropy estimate of quantized residual
+        residual_abs = (target - x_hat_q).abs() * 255   # uint8 scale
+        mae = residual_abs.mean()                        # Laplacian scale b
+        bpp_residual = torch.log2(2 * math.e * (mae + 1e-6))
+
+        # Total BPP — no lambda needed
+        loss = bpp_neural + bpp_residual
+
+        return {
+            "loss": loss,
+            "bpp_loss": bpp_neural,
+            "bpp_residual_est": bpp_residual,
+            "l1_loss": mae / 255,
+            "mse_loss": F.mse_loss(output["x_hat"], target),
+        }
+```
 
 ### 范围
-- 对 Phase 6b 的 checkpoint 执行完整 benchmark（含残差计算）。
-- 与 Phase 5 的 benchmark 结果横向对比。
-- 输出对比报告。
+- 在 `compressai/losses/rate_distortion.py` 中新增 `TotalBppLoss` 类。
+- 注册到 criterion registry。
+- 在 `compressai/losses/__init__.py` 中导出。
+- 在 `train_neutronstar.py` 中接入 `--criterion total-bpp` 选项。
 
 ### 交付物
-- Phase 6c 的 benchmark 结果（JSON，落盘到报告目录）。
-- 对比摘要，至少包含：
-
-| 指标 | Phase 5 (MSE) | Phase 6c (L1) | 变化方向 |
-|---|---|---|---|
-| `bpp_main` | — | — | — |
-| `bpp_residual` | — | — | — |
-| `bpp_total` | — | — | ↓ 目标 |
-| `lossless_restored` | true | true | 不变 |
+- `TotalBppLoss` 类（在 `compressai/losses/rate_distortion.py`）。
+- 更新后的 `compressai/losses/__init__.py`。
+- 更新后的 `train_neutronstar.py`（支持 `--criterion total-bpp`）。
+- 用 `total-bpp` criterion 训练的 checkpoint。
+- 与 Phase 6b（L1 + lambda=1.0）的 benchmark 对比结果。
 
 ### 可验证结果
+- `TotalBppLoss` 可被 import 和实例化。
+- `forward(output, target)` 返回字典包含 `{"loss", "bpp_loss", "bpp_residual_est", "l1_loss", "mse_loss"}`。
+- 训练过程中 `loss` 持续下降。
 - `lossless_restored == true`（无损恢复仍然成功）。
-- `bpp_total` 是否下降是 Phase 6c 的主判据。
-- 如果 `bpp_total` 没有下降或反而上升，记录为已知问题，进入 Phase 6d 分析原因。
+- 与 Phase 6b 对比：
+
+| 指标 | Phase 6b (L1, λ=1.0) | Phase 6c (TotalBppLoss) | 变化方向 |
+|---|---|---|---|
+| `bpp_main` | — | — | 可能↑（模型选择花更多 bits） |
+| `bpp_residual` | — | — | ↓ 目标 |
+| `bpp_total` | — | — | **↓ 主判据** |
+| `lossless_restored` | true | true | 不变 |
 
 ### 决策点
-- **如果 `bpp_total` 下降**：L1 loss 有效。可选择继续 Phase 6d 做进一步改进，或直接进入 Phase 7。
-- **如果 `bpp_total` 持平或上升**：分析 `bpp_main` 和 `bpp_residual` 的变化方向，调整 lambda 或进入 Phase 6d 尝试 dead-zone 改进。
+- **如果 `bpp_total` 下降**：TotalBppLoss 有效，找到了比 L1+lambda 更好的操作点。
+  可直接进入 Phase 6d 或 Phase 7。
+- **如果 `bpp_total` 持平或上升**：检查 `bpp_neural` 和 `bpp_residual_est` 的训练曲线，
+  分析是否 Laplacian 假设不够准确或梯度数值不稳定，考虑加入 clamp 或温度系数。
+
+### 注意事项
+- `mae + 1e-6` 中的 epsilon 防止 log(0)，但如果训练后期 MAE 极小可能需要调整。
+- STE 的 round() 操作在 backward 时梯度直通，可能导致训练初期不稳定，
+  建议监控训练曲线。如果不稳定，可以用退火策略：前 N 个 epoch 用 L1，之后切换到 TotalBppLoss。
 
 ### 复杂度控制
-- 预计改动文件数：`0`（只执行 benchmark 命令，不改代码）
+- 预计改动文件数：`3`（`rate_distortion.py` + `__init__.py` + `train_neutronstar.py`）
 - 适合作为单次 agent 任务
 
 ---
@@ -543,7 +638,7 @@ residual = target_255 - x_hat_q.clamp(0, 255)
 6. residual-aware loss 优化总码率
    - 6a. 实现 `ResidualAwareRDLoss`（L1 替换 MSE）— 只改 loss 类，2 文件
    - 6b. 接入训练脚本，完成首次 L1 训练 — 只改训练脚本，1 文件
-   - 6c. benchmark 对比 L1 vs MSE — 不改代码，只跑 benchmark
+   - 6c. 实现 `TotalBppLoss`（直接最小化 total BPP，消除 lambda）— 3 文件
    - 6d. Dead-zone L1 量化感知改进（条件性）— 2-3 文件
 7. 端到端压缩流程工程化
 8. 性能优化
