@@ -31,6 +31,7 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from pytorch_msssim import ms_ssim
 
@@ -69,6 +70,42 @@ class RateDistortionLoss(nn.Module):
             distortion = 255**2 * out["mse_loss"]
 
         out["loss"] = self.lmbda * distortion + out["bpp_loss"]
+        if self.return_type == "all":
+            return out
+        else:
+            return out[self.return_type]
+
+
+@register_criterion("ResidualAwareRDLoss")
+class ResidualAwareRDLoss(nn.Module):
+    """Rate-distortion loss using L1 distortion as a proxy for residual compressibility.
+
+    Under a Laplacian residual model the optimal estimator minimises L1 (not MSE).
+    The scaling factor is 255 (not 255**2) because L1 is first-order in pixel values.
+    """
+
+    def __init__(self, lmbda=0.01, return_type="all"):
+        super().__init__()
+        self.lmbda = lmbda
+        self.return_type = return_type
+
+    def forward(self, output, target):
+        N, _, H, W = target.size()
+        out = {}
+        num_pixels = N * H * W
+
+        out["bpp_loss"] = sum(
+            (torch.log(likelihoods).sum() / (-math.log(2) * num_pixels))
+            for likelihoods in output["likelihoods"].values()
+        )
+
+        out["l1_loss"] = F.l1_loss(output["x_hat"], target)
+        out["residual_l1"] = out["l1_loss"]
+        out["mse_loss"] = F.mse_loss(output["x_hat"], target)
+
+        distortion = 255 * out["l1_loss"]
+        out["loss"] = self.lmbda * distortion + out["bpp_loss"]
+
         if self.return_type == "all":
             return out
         else:

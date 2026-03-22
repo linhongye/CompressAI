@@ -34,7 +34,7 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
-from compressai.losses import RateDistortionLoss
+from compressai.losses import ResidualAwareRDLoss
 from compressai.models import NeutronStar2026
 from compressai.optimizers import net_aux_optimizer
 
@@ -118,7 +118,8 @@ def train_one_epoch(model, criterion, loader, optimizer, aux_optimizer, epoch, c
             print(
                 f"Train epoch {epoch}: [{i * len(d)}/{len(loader.dataset)} ({pct:.0f}%)]"
                 f'  loss={out_criterion["loss"].item():.4f}'
-                f'  mse={out_criterion["mse_loss"].item():.4f}'
+                f'  l1={out_criterion["l1_loss"].item():.6f}'
+                f'  mse={out_criterion["mse_loss"].item():.6f}'
                 f'  bpp={out_criterion["bpp_loss"].item():.4f}'
                 f"  aux={aux_loss.item():.4f}",
                 flush=True,
@@ -130,7 +131,7 @@ def test_epoch(epoch, loader, model, criterion):
     model.eval()
     device = next(model.parameters()).device
 
-    meters = {k: AverageMeter() for k in ("loss", "mse_loss", "bpp_loss", "aux_loss")}
+    meters = {k: AverageMeter() for k in ("loss", "l1_loss", "mse_loss", "bpp_loss", "aux_loss")}
 
     for d in loader:
         d = d.to(device)
@@ -138,6 +139,7 @@ def test_epoch(epoch, loader, model, criterion):
         out_criterion = criterion(out_net, d)
 
         meters["loss"].update(out_criterion["loss"].item())
+        meters["l1_loss"].update(out_criterion["l1_loss"].item())
         meters["mse_loss"].update(out_criterion["mse_loss"].item())
         meters["bpp_loss"].update(out_criterion["bpp_loss"].item())
         meters["aux_loss"].update(model.aux_loss().item())
@@ -145,7 +147,8 @@ def test_epoch(epoch, loader, model, criterion):
     print(
         f"Test  epoch {epoch}:"
         f'  loss={meters["loss"].avg:.4f}'
-        f'  mse={meters["mse_loss"].avg:.4f}'
+        f'  l1={meters["l1_loss"].avg:.6f}'
+        f'  mse={meters["mse_loss"].avg:.6f}'
         f'  bpp={meters["bpp_loss"].avg:.4f}'
         f'  aux={meters["aux_loss"].avg:.4f}',
         flush=True,
@@ -182,7 +185,7 @@ def parse_args(argv=None):
     parser.add_argument("-lr", "--learning-rate", type=float, default=1e-4)
     parser.add_argument("--aux-learning-rate", type=float, default=1e-3)
     parser.add_argument("--patch-size", type=int, nargs=2, default=(256, 256))
-    parser.add_argument("--lmbda", type=float, default=1e-2,
+    parser.add_argument("--lmbda", type=float, default=1.0,
                         help="Rate-distortion trade-off lambda.")
     parser.add_argument("-n", "--num-workers", type=int, default=2)
     parser.add_argument("--clip-max-norm", type=float, default=1.0)
@@ -204,7 +207,6 @@ def parse_args(argv=None):
         help="Train on single-channel grayscale images (default: True). "
              "Use --no-grayscale for RGB.",
     )
-
     return parser.parse_args(argv)
 
 
@@ -278,7 +280,8 @@ def main(argv=None):
     optimizer, aux_optimizer = optims["net"], optims["aux"]
     lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, "min")
 
-    criterion = RateDistortionLoss(lmbda=args.lmbda)
+    criterion = ResidualAwareRDLoss(lmbda=args.lmbda)
+    print(f"Criterion: ResidualAwareRDLoss (lambda={args.lmbda})", flush=True)
 
     last_epoch = 0
     if args.checkpoint is not None:
